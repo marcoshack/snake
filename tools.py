@@ -26,11 +26,13 @@ def get_rust_server_logs(hours: int = 24) -> str:
     opensearch_port = os.environ.get("OPENSEARCH_PORT", "9200")
     opensearch_user = os.environ.get("OPENSEARCH_USER")
     opensearch_password = os.environ.get("OPENSEARCH_PASSWORD")
+    opensearch_index = os.environ.get("OPENSEARCH_INDEX")
+    opensearch_result_size = int(os.environ.get("OPENSEARCH_RESULT_SIZE", "10000"))
 
-    if not opensearch_host or not opensearch_user or not opensearch_password:
-        return "Error: OPENSEARCH_HOST, OPENSEARCH_USER, and OPENSEARCH_PASSWORD environment variables must be set"
+    if not opensearch_host or not opensearch_user or not opensearch_password or not opensearch_index:
+        return "Error: OPENSEARCH_HOST, OPENSEARCH_USER, OPENSEARCH_PASSWORD, and OPENSEARCH_INDEX environment variables must be set"
 
-    url = f"http://{opensearch_host}:{opensearch_port}/rustserver-logs/_search"
+    url = f"http://{opensearch_host}:{opensearch_port}/{opensearch_index}/_search"
     headers = {"Content-Type": "application/json"}
     auth = (opensearch_user, opensearch_password)
 
@@ -44,7 +46,7 @@ def get_rust_server_logs(hours: int = 24) -> str:
             }
         },
         "sort": [{"@timestamp": {"order": "desc"}}],
-        "size": 10000
+        "size": opensearch_result_size
     }
 
     response = requests.get(url, headers=headers, auth=auth, json=query)
