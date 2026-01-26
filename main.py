@@ -1,3 +1,9 @@
+import os
+import re
+import signal
+import time
+from datetime import datetime
+
 from dotenv import load_dotenv
 from strands import Agent
 from strands.models.anthropic import AnthropicModel
@@ -5,13 +11,58 @@ from tools import get_rust_server_logs, post_discord_admin_alert, save_report_ht
 
 load_dotenv()
 
-# Create an agent using Anthropic API directly
-model = AnthropicModel(model_id="claude-sonnet-4-20250514", max_tokens=4096)
-agent = Agent(model=model, tools=[get_rust_server_logs, post_discord_admin_alert, save_report_html])
+# Flag for graceful shutdown
+shutdown_requested = False
 
-# Ask the agent to analyze the Rust server logs
-agent("""
-Fetch the server logs from the Rust game server for the last 24 hours.
+
+def signal_handler(signum, frame):
+    """Handle shutdown signals gracefully."""
+    global shutdown_requested
+    print(f"\n[{datetime.now().isoformat()}] Received signal {signum}, shutting down gracefully...")
+    shutdown_requested = True
+
+
+def parse_duration(duration_str: str) -> int:
+    """
+    Parse a duration string into seconds.
+
+    Supported formats:
+    - "30m" or "30M" -> 30 minutes
+    - "24h" or "24H" -> 24 hours
+    - "1d" or "1D" -> 1 day
+    - "1w" or "1W" -> 1 week
+
+    Returns the duration in seconds.
+    """
+    duration_str = duration_str.strip().lower()
+
+    match = re.match(r'^(\d+)\s*([mhdw])$', duration_str)
+    if not match:
+        raise ValueError(
+            f"Invalid duration format: '{duration_str}'. "
+            "Expected format like '30m', '24h', '1d', or '1w'."
+        )
+
+    value = int(match.group(1))
+    unit = match.group(2)
+
+    multipliers = {
+        'm': 60,           # minutes
+        'h': 3600,         # hours
+        'd': 86400,        # days
+        'w': 604800,       # weeks
+    }
+
+    return value * multipliers[unit]
+
+
+def run_analysis(agent: Agent, period_minutes: int) -> None:
+    """Run a single analysis cycle for the specified period."""
+    print(f"[{datetime.now().isoformat()}] Starting analysis for the last {period_minutes} minutes...")
+
+    try:
+        agent(f"""
+Fetch the server logs from the Rust game server for the last {period_minutes} minutes.
 
 Analyze the logs focusing on:
 1. **Period & Activity Level**: Time range and overall activity
@@ -33,3 +84,54 @@ Security concerns that require full analysis:
 
 Finally, save the full report as an HTML file for archival.
 """)
+        print(f"[{datetime.now().isoformat()}] Analysis completed successfully.")
+    except Exception as e:
+        print(f"[{datetime.now().isoformat()}] Analysis failed with error: {e}")
+
+
+def main():
+    # Set up signal handlers for graceful shutdown
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+
+    # Parse the analysis frequency
+    frequency_str = os.getenv("SNAKE_ANALYSIS_FREQUENCY", "24h")
+    try:
+        interval_seconds = parse_duration(frequency_str)
+    except ValueError as e:
+        print(f"Error: {e}")
+        return 1
+
+    # Calculate analysis period with 10% buffer
+    period_minutes = int((interval_seconds / 60) * 1.1)
+
+    print(f"[{datetime.now().isoformat()}] Snake agent starting...")
+    print(f"[{datetime.now().isoformat()}] Analysis frequency: {frequency_str} ({interval_seconds} seconds)")
+    print(f"[{datetime.now().isoformat()}] Analysis period: {period_minutes} minutes (includes 10% buffer)")
+
+    # Create the agent
+    model = AnthropicModel(model_id="claude-sonnet-4-20250514", max_tokens=4096)
+    agent = Agent(model=model, tools=[get_rust_server_logs, post_discord_admin_alert, save_report_html])
+
+    # Run the first analysis immediately
+    run_analysis(agent, period_minutes)
+
+    # Continue running periodically until shutdown is requested
+    while not shutdown_requested:
+        next_run = datetime.now().timestamp() + interval_seconds
+        next_run_time = datetime.fromtimestamp(next_run)
+        print(f"[{datetime.now().isoformat()}] Next analysis scheduled for: {next_run_time.isoformat()}")
+
+        # Sleep in small increments to allow for graceful shutdown
+        while not shutdown_requested and time.time() < next_run:
+            time.sleep(1)
+
+        if not shutdown_requested:
+            run_analysis(agent, period_minutes)
+
+    print(f"[{datetime.now().isoformat()}] Snake agent stopped.")
+    return 0
+
+
+if __name__ == "__main__":
+    exit(main())
