@@ -36,6 +36,9 @@ services:
       # Path to session storage inside the container
       SNAKE_SESSIONS_DIR: /app/sessions
 
+      # Max conversation messages to retain per agent (sliding window)
+      SNAKE_CONTEXT_WINDOW_SIZE: ${SNAKE_CONTEXT_WINDOW_SIZE:-10}
+
       # Webhook server port (internal only, not exposed to host)
       SNAKE_WEBHOOK_PORT: ${SNAKE_WEBHOOK_PORT:-8000}
 

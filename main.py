@@ -14,7 +14,7 @@ from pathlib import Path
 import yaml
 from dotenv import load_dotenv
 from strands import Agent
-from strands.agent.conversation_manager import SummarizingConversationManager
+from strands.agent.conversation_manager import SlidingWindowConversationManager
 from strands.models.anthropic import AnthropicModel
 from strands.session import FileSessionManager
 from tools import TOOL_REGISTRY
@@ -181,7 +181,8 @@ def create_agent(name: str, agents_dir: Path, period_minutes: int, sessions_dir:
         session_id=f"snake-{name}",
         storage_dir=str(sessions_dir),
     )
-    conversation_manager = SummarizingConversationManager()
+    window_size = int(os.environ.get("SNAKE_CONTEXT_WINDOW_SIZE", "20"))
+    conversation_manager = SlidingWindowConversationManager(window_size=window_size)
     agent = Agent(
         model=model,
         tools=definition["tools"],
@@ -226,8 +227,22 @@ def run_agent(agent: Agent, name: str, agents_dir: Path, period_minutes: int, lo
     try:
         with open(agent_log_file, 'w') as f:
             with redirect_stdout(f), redirect_stderr(f):
-                agent("Run your analysis cycle now.")
-        print(f"[{datetime.now().isoformat()}] Agent '{name}' completed. Log: {agent_log_file.name}")
+                result = agent("Run your analysis cycle now.")
+
+        usage = result.metrics.accumulated_usage
+        token_parts = [
+            f"in={usage.get('inputTokens', 0)}",
+            f"out={usage.get('outputTokens', 0)}",
+        ]
+        if usage.get("cacheReadInputTokens"):
+            token_parts.append(f"cache_read={usage['cacheReadInputTokens']}")
+        if usage.get("cacheWriteInputTokens"):
+            token_parts.append(f"cache_write={usage['cacheWriteInputTokens']}")
+
+        print(
+            f"[{datetime.now().isoformat()}] Agent '{name}' completed. "
+            f"Tokens: {', '.join(token_parts)} | Log: {agent_log_file.name}"
+        )
     except Exception as e:
         print(f"[{datetime.now().isoformat()}] Agent '{name}' failed: {e}")
 
