@@ -5,7 +5,7 @@ REMOTE_IMAGE := ghcr.io/marcoshack/snake:latest
 DOCKER ?= docker
 
 build:
-	$(DOCKER) build -t $(IMAGE_NAME) .
+	$(DOCKER) build -t $(IMAGE_NAME) -t $(REMOTE_IMAGE) .
 
 run: build
 	$(DOCKER) run -v $(PWD)/.env:/app/.env:ro -v $(PWD)/build/output:/app/build/output $(IMAGE_NAME)

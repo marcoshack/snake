@@ -1,10 +1,11 @@
-version: '3.8'
-
 services:
   snake:
     image: ghcr.io/marcoshack/snake:latest
     container_name: snake
     environment:
+      # Force Python to run in unbuffered mode for immediate log output
+      PYTHONUNBUFFERED: 1
+
       # Anthropic API key for accessing Claude models
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
 
@@ -19,11 +20,16 @@ services:
       # Discord webhook for posting admin alerts
       DISCORD_RUST_ADMIN_WEBHOOK: ${DISCORD_RUST_ADMIN_WEBHOOK}
 
-      # Directory where HTML reports are saved (container path)
-      SNAKE_REPORT_OUTPUT_DIR: /app/reports
+      # Override paths to container paths (agent reads these inside container)
+      REPORT_OUTPUT_DIR: /app/reports
+      LOG_DIR: /app/logs
+
+      # How often to run the analysis
+      ANALYSIS_FREQUENCY: ${ANALYSIS_FREQUENCY:-24h}
 
     volumes:
-      # Mount host directory to container's /app/reports
-      - ${HOST_REPORT_DIR:-./reports}:/app/reports
+      # Mount host directories (from .env) to container paths
+      - ${REPORT_OUTPUT_DIR:-./reports}:/app/reports
+      - ${LOG_DIR:-./logs}:/app/logs
 
     restart: unless-stopped
