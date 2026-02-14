@@ -1,4 +1,6 @@
 import json
+import logging
+import logging.handlers
 import os
 import queue
 import re
@@ -6,7 +8,6 @@ import signal
 import sys
 import threading
 import time
-from contextlib import redirect_stdout, redirect_stderr
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -27,11 +28,66 @@ shutdown_requested = False
 DEFAULT_MODEL = "claude-sonnet-4-20250514"
 DEFAULT_MAX_TOKENS = 4096
 
+# Main application logger (stdout)
+logger = logging.getLogger("snake")
+
+
+def setup_logging() -> None:
+    """Configure the main application logger to write to stdout."""
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", datefmt="%Y-%m-%dT%H:%M:%S"))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+
+
+def setup_agent_logger(name: str, log_dir: Path) -> logging.Logger:
+    """Create a per-agent logger with daily file rotation.
+
+    Each agent gets its own logger writing to log_dir/<name>.log,
+    rotating at midnight and keeping 30 days of history.
+    """
+    agent_logger = logging.getLogger(f"snake.agent.{name}")
+    agent_logger.setLevel(logging.INFO)
+    agent_logger.propagate = False
+
+    handler = logging.handlers.TimedRotatingFileHandler(
+        log_dir / f"{name}.log",
+        when="midnight",
+        backupCount=30,
+        encoding="utf-8",
+    )
+    handler.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", datefmt="%Y-%m-%dT%H:%M:%S"))
+    agent_logger.addHandler(handler)
+    return agent_logger
+
+
+class LoggerWriter:
+    """File-like object that redirects writes to a logger."""
+
+    def __init__(self, log: logging.Logger):
+        self._logger = log
+        self._buf = ""
+
+    def write(self, msg: str) -> int:
+        if not msg:
+            return 0
+        self._buf += msg
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            if line:
+                self._logger.info("%s", line)
+        return len(msg)
+
+    def flush(self) -> None:
+        if self._buf:
+            self._logger.info("%s", self._buf)
+            self._buf = ""
+
 
 def signal_handler(signum, frame):
     """Handle shutdown signals gracefully."""
     global shutdown_requested
-    print(f"\n[{datetime.now().isoformat()}] Received signal {signum}, shutting down gracefully...")
+    logger.info("Received signal %s, shutting down gracefully...", signum)
     shutdown_requested = True
 
 
@@ -167,7 +223,7 @@ def create_agent(name: str, agents_dir: Path, period_minutes: int, sessions_dir:
     try:
         definition = load_agent_definition(name, agents_dir)
     except (FileNotFoundError, ValueError) as e:
-        print(f"[{datetime.now().isoformat()}] Failed to load agent '{name}': {e}")
+        logger.error("Failed to load agent '%s': %s", name, e)
         return None
 
     period_hours = max(1, int((period_minutes + 59) / 60))
@@ -192,7 +248,7 @@ def create_agent(name: str, agents_dir: Path, period_minutes: int, sessions_dir:
         agent_id=name,
     )
 
-    print(f"[{datetime.now().isoformat()}] Created persistent agent '{name}' (session: {sessions_dir})")
+    logger.info("Created persistent agent '%s' (session: %s)", name, sessions_dir)
     return agent, definition
 
 
@@ -204,7 +260,7 @@ def refresh_agent_system_prompt(agent: Agent, name: str, agents_dir: Path, perio
     try:
         definition = load_agent_definition(name, agents_dir)
     except (FileNotFoundError, ValueError) as e:
-        print(f"[{datetime.now().isoformat()}] Failed to reload agent '{name}': {e}")
+        logger.error("Failed to reload agent '%s': %s", name, e)
         return
 
     period_hours = max(1, int((period_minutes + 59) / 60))
@@ -214,20 +270,30 @@ def refresh_agent_system_prompt(agent: Agent, name: str, agents_dir: Path, perio
     )
 
 
-def run_agent(agent: Agent, name: str, agents_dir: Path, period_minutes: int, log_dir: Path) -> None:
+def run_agent(agent: Agent, name: str, agents_dir: Path, period_minutes: int,
+              log_dir: Path, agent_loggers: dict[str, logging.Logger]) -> None:
     """Run a single analysis cycle on a persistent agent instance."""
-    print(f"[{datetime.now().isoformat()}] Running agent '{name}'...")
+    logger.info("Running agent '%s'...", name)
 
     # Reload system prompt from disk to pick up any changes
     refresh_agent_system_prompt(agent, name, agents_dir, period_minutes)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    agent_log_file = log_dir / f"agent_log_{name}_{timestamp}.txt"
+    agent_log = agent_loggers[name]
+    agent_log.info("=" * 80)
+    agent_log.info("Run started")
+    agent_log.info("=" * 80)
 
     try:
-        with open(agent_log_file, 'w') as f:
-            with redirect_stdout(f), redirect_stderr(f):
-                result = agent("Run your analysis cycle now.")
+        writer = LoggerWriter(agent_log)
+        old_stdout, old_stderr = sys.stdout, sys.stderr
+        sys.stdout = writer
+        sys.stderr = writer
+        try:
+            result = agent("Run your analysis cycle now.")
+        finally:
+            writer.flush()
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
 
         usage = result.metrics.accumulated_usage
         token_parts = [
@@ -239,12 +305,9 @@ def run_agent(agent: Agent, name: str, agents_dir: Path, period_minutes: int, lo
         if usage.get("cacheWriteInputTokens"):
             token_parts.append(f"cache_write={usage['cacheWriteInputTokens']}")
 
-        print(
-            f"[{datetime.now().isoformat()}] Agent '{name}' completed. "
-            f"Tokens: {', '.join(token_parts)} | Log: {agent_log_file.name}"
-        )
+        logger.info("Agent '%s' completed. Tokens: %s", name, ", ".join(token_parts))
     except Exception as e:
-        print(f"[{datetime.now().isoformat()}] Agent '{name}' failed: {e}")
+        logger.error("Agent '%s' failed: %s", name, e)
 
 
 class WebhookHandler(BaseHTTPRequestHandler):
@@ -281,7 +344,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
         self.wfile.write(json.dumps({"error": "method not allowed, use POST"}).encode())
 
     def log_message(self, format, *args):
-        print(f"[{datetime.now().isoformat()}] Webhook: {format % args}")
+        logger.info("Webhook: %s", format % args)
 
 
 def start_webhook_server(port: int, valid_agents: set[str], webhook_queue: queue.Queue) -> HTTPServer:
@@ -291,11 +354,13 @@ def start_webhook_server(port: int, valid_agents: set[str], webhook_queue: queue
     server.webhook_queue = webhook_queue
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    print(f"[{datetime.now().isoformat()}] Webhook server listening on 0.0.0.0:{port}")
+    logger.info("Webhook server listening on 0.0.0.0:%s", port)
     return server
 
 
 def main():
+    setup_logging()
+
     # Set up signal handlers for graceful shutdown
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
@@ -305,35 +370,35 @@ def main():
     try:
         agents_config = parse_agents_config(agents_str)
     except ValueError as e:
-        print(f"Error: {e}")
+        logger.error("Error: %s", e)
         return 1
 
     if not agents_config:
-        print("Error: SNAKE_AGENTS is empty. Set it to 'name:frequency' pairs (e.g., 'operational-report:1h,admin-chatbot:10m').")
+        logger.error("SNAKE_AGENTS is empty. Set it to 'name:frequency' pairs (e.g., 'operational-report:1h,admin-chatbot:10m').")
         return 1
 
     agents_dir = Path(os.getenv("SNAKE_AGENTS_DIR", "./agents"))
     if not agents_dir.is_dir():
-        print(f"Error: Agents directory not found: {agents_dir}")
+        logger.error("Agents directory not found: %s", agents_dir)
         return 1
 
     # Set up log directory for agent output
-    log_dir = Path(os.getenv("LOG_DIR", "./logs"))
+    log_dir = Path(os.getenv("SNAKE_AGENT_LOG_DIR", os.getenv("LOG_DIR", "./logs")))
     log_dir.mkdir(parents=True, exist_ok=True)
 
     # Set up sessions directory for persistent conversation history
     sessions_dir = Path(os.getenv("SNAKE_SESSIONS_DIR", "./sessions"))
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[{datetime.now().isoformat()}] Snake starting...")
-    print(f"[{datetime.now().isoformat()}] Agents directory: {agents_dir}")
-    print(f"[{datetime.now().isoformat()}] Sessions directory: {sessions_dir}")
-    print(f"[{datetime.now().isoformat()}] Log directory: {log_dir}")
+    logger.info("Snake starting...")
+    logger.info("Agents directory: %s", agents_dir)
+    logger.info("Sessions directory: %s", sessions_dir)
+    logger.info("Agent log directory: %s", log_dir)
     for ac in agents_config:
         if ac["frequency"] == "webhook":
-            print(f"[{datetime.now().isoformat()}]   Agent '{ac['name']}': webhook-triggered, query period: {ac['period_minutes']}m")
+            logger.info("  Agent '%s': webhook-triggered, query period: %sm", ac["name"], ac["period_minutes"])
         else:
-            print(f"[{datetime.now().isoformat()}]   Agent '{ac['name']}': every {ac['frequency']} ({ac['interval_seconds']}s), query period: {ac['period_minutes']}m")
+            logger.info("  Agent '%s': every %s (%ss), query period: %sm", ac["name"], ac["frequency"], ac["interval_seconds"], ac["period_minutes"])
 
     # Create persistent agent instances (conversation history is preserved across runs)
     agents_by_name = {ac["name"]: ac for ac in agents_config}
@@ -342,13 +407,18 @@ def main():
     for ac in agents_config:
         result = create_agent(ac["name"], agents_dir, ac["period_minutes"], sessions_dir)
         if result is None:
-            print(f"[{datetime.now().isoformat()}] Skipping agent '{ac['name']}' due to load failure.")
+            logger.warning("Skipping agent '%s' due to load failure.", ac["name"])
             continue
         agent_instances[ac["name"]] = result[0]
 
     if not agent_instances:
-        print("Error: No agents could be loaded.")
+        logger.error("No agents could be loaded.")
         return 1
+
+    # Create per-agent loggers with daily file rotation
+    agent_loggers: dict[str, logging.Logger] = {}
+    for name in agent_instances:
+        agent_loggers[name] = setup_agent_logger(name, log_dir)
 
     # Start webhook server
     webhook_port = int(os.getenv("SNAKE_WEBHOOK_PORT", "8000"))
@@ -371,8 +441,11 @@ def main():
                 break
             if agent_name in agent_instances:
                 ac = agents_by_name[agent_name]
-                print(f"[{datetime.now().isoformat()}] Webhook triggered agent '{agent_name}'")
-                run_agent(agent_instances[agent_name], agent_name, agents_dir, ac["period_minutes"], log_dir)
+                logger.info("Webhook triggered agent '%s'", agent_name)
+                run_agent(agent_instances[agent_name], agent_name, agents_dir, ac["period_minutes"], log_dir, agent_loggers)
+
+            if shutdown_requested:
+                break
 
         if shutdown_requested:
             break
@@ -391,11 +464,11 @@ def main():
                     if run_at > now:
                         break
                     ac = agents_by_name[name]
-                    run_agent(agent_instances[name], name, agents_dir, ac["period_minutes"], log_dir)
+                    run_agent(agent_instances[name], name, agents_dir, ac["period_minutes"], log_dir, agent_loggers)
                     schedule[name] = time.time() + ac["interval_seconds"]
             else:
                 next_run_time = datetime.fromtimestamp(next_run)
-                print(f"[{datetime.now().isoformat()}] Next up: '{next_agent}' at {next_run_time.isoformat()}")
+                logger.info("Next up: '%s' at %s", next_agent, next_run_time.isoformat())
                 while not shutdown_requested and time.time() < next_run and webhook_q.empty():
                     time.sleep(1)
         else:
@@ -403,7 +476,7 @@ def main():
             time.sleep(1)
 
     webhook_server.shutdown()
-    print(f"[{datetime.now().isoformat()}] Snake stopped.")
+    logger.info("Snake stopped.")
     return 0
 
 

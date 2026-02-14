@@ -24,8 +24,8 @@ services:
       SNAKE_CHAT_API_ENDPOINT: ${SNAKE_CHAT_API_ENDPOINT}
 
       # Override paths to container paths (agent reads these inside container)
-      REPORT_OUTPUT_DIR: /app/reports
-      LOG_DIR: /app/logs
+      SNAKE_REPORT_DIR: /app/reports
+      SNAKE_AGENT_LOG_DIR: /app/logs
 
       # Agents to run with per-agent frequency (name:frequency pairs)
       SNAKE_AGENTS: ${SNAKE_AGENTS:-operational-report:24h}
@@ -44,8 +44,8 @@ services:
 
     volumes:
       # Mount host directories (from .env) to container paths
-      - ${REPORT_OUTPUT_DIR:-./reports}:/app/reports
-      - ${LOG_DIR:-./logs}:/app/logs
+      - ${SNAKE_REPORT_DIR:-${REPORT_OUTPUT_DIR:-./reports}}:/app/reports
+      - ${SNAKE_AGENT_LOG_DIR:-${LOG_DIR:-./logs}}:/app/logs
       # Mount agents directory for hot-reload of agent definitions
       - ${SNAKE_AGENTS_DIR:-./agents}:/app/agents
       # Mount sessions directory for persistent conversation history

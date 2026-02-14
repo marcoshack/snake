@@ -132,7 +132,7 @@ def save_report_html(report_markdown: str, filename: str = None) -> str:
     Returns:
         Path to the saved HTML file or error message
     """
-    output_dir = os.getenv("REPORT_OUTPUT_DIR", "./reports")
+    output_dir = os.getenv("SNAKE_REPORT_DIR", os.getenv("REPORT_OUTPUT_DIR", "./reports"))
     os.makedirs(output_dir, exist_ok=True)
 
     if not filename:

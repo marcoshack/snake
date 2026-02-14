@@ -43,8 +43,8 @@ cp .env.example .env
 | `OPENSEARCH_INDEX` | Log index name | (required) |
 | `OPENSEARCH_RESULT_SIZE` | Max results per query | `10000` |
 | `DISCORD_RUST_ADMIN_WEBHOOK` | Discord webhook URL for alerts | (required) |
-| `REPORT_OUTPUT_DIR` | Directory for HTML reports | `./reports` |
-| `LOG_DIR` | Directory for agent execution logs | `./logs` |
+| `SNAKE_REPORT_DIR` | Directory for HTML reports | `./reports` |
+| `SNAKE_AGENT_LOG_DIR` | Directory for agent execution logs | `./logs` |
 | `SNAKE_AGENTS` | Agents and their frequencies | `operational-report:24h` |
 | `SNAKE_AGENTS_DIR` | Path to agent definitions | `./agents` |
 | `SNAKE_WEBHOOK_PORT` | Port for the webhook HTTP server | `8000` |
