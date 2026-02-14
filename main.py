@@ -1,10 +1,14 @@
+import json
 import os
+import queue
 import re
 import signal
 import sys
+import threading
 import time
 from contextlib import redirect_stdout, redirect_stderr
 from datetime import datetime
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
 import yaml
@@ -70,9 +74,12 @@ def parse_agents_config(agents_str: str) -> list[dict]:
     Parse the SNAKE_AGENTS env var into a list of agent configs.
 
     Format: "name1:frequency1,name2:frequency2"
-    Example: "operational-report:1h,admin-chatbot:10m"
+    Example: "operational-report:1h,admin-chatbot:webhook"
 
-    Returns a list of dicts with keys: name, interval_seconds, period_minutes
+    Frequency can be a duration (e.g., "1h", "30m") for scheduled agents,
+    or "webhook" for agents triggered by HTTP webhook calls.
+
+    Returns a list of dicts with keys: name, frequency, interval_seconds, period_minutes
     """
     agents = []
     for entry in agents_str.split(","):
@@ -82,19 +89,28 @@ def parse_agents_config(agents_str: str) -> list[dict]:
         if ":" not in entry:
             raise ValueError(
                 f"Invalid agent entry '{entry}'. "
-                "Expected format 'name:frequency' (e.g., 'operational-report:1h')."
+                "Expected format 'name:frequency' (e.g., 'operational-report:1h' or 'admin-chatbot:webhook')."
             )
         name, frequency = entry.split(":", 1)
         name = name.strip()
         frequency = frequency.strip()
-        interval_seconds = parse_duration(frequency)
-        period_minutes = int((interval_seconds / 60) * 1.1)
-        agents.append({
-            "name": name,
-            "frequency": frequency,
-            "interval_seconds": interval_seconds,
-            "period_minutes": period_minutes,
-        })
+
+        if frequency == "webhook":
+            agents.append({
+                "name": name,
+                "frequency": "webhook",
+                "interval_seconds": None,
+                "period_minutes": 5,
+            })
+        else:
+            interval_seconds = parse_duration(frequency)
+            period_minutes = int((interval_seconds / 60) * 1.1)
+            agents.append({
+                "name": name,
+                "frequency": frequency,
+                "interval_seconds": interval_seconds,
+                "period_minutes": period_minutes,
+            })
     return agents
 
 
@@ -216,6 +232,54 @@ def run_agent(agent: Agent, name: str, agents_dir: Path, period_minutes: int, lo
         print(f"[{datetime.now().isoformat()}] Agent '{name}' failed: {e}")
 
 
+class WebhookHandler(BaseHTTPRequestHandler):
+    """HTTP handler for agent webhook triggers.
+
+    Accepts POST /agents/<agent-name> and queues the agent for execution.
+    """
+
+    def do_POST(self):
+        parts = self.path.strip("/").split("/")
+        if len(parts) == 2 and parts[0] == "agents":
+            agent_name = parts[1]
+            if agent_name in self.server.valid_agents:
+                self.server.webhook_queue.put(agent_name)
+                self.send_response(202)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "accepted", "agent": agent_name}).encode())
+            else:
+                self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": f"agent '{agent_name}' not found"}).encode())
+        else:
+            self.send_response(404)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "not found"}).encode())
+
+    def do_GET(self):
+        self.send_response(405)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps({"error": "method not allowed, use POST"}).encode())
+
+    def log_message(self, format, *args):
+        print(f"[{datetime.now().isoformat()}] Webhook: {format % args}")
+
+
+def start_webhook_server(port: int, valid_agents: set[str], webhook_queue: queue.Queue) -> HTTPServer:
+    """Start the webhook HTTP server in a daemon thread."""
+    server = HTTPServer(("0.0.0.0", port), WebhookHandler)
+    server.valid_agents = valid_agents
+    server.webhook_queue = webhook_queue
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    print(f"[{datetime.now().isoformat()}] Webhook server listening on 0.0.0.0:{port}")
+    return server
+
+
 def main():
     # Set up signal handlers for graceful shutdown
     signal.signal(signal.SIGTERM, signal_handler)
@@ -251,7 +315,10 @@ def main():
     print(f"[{datetime.now().isoformat()}] Sessions directory: {sessions_dir}")
     print(f"[{datetime.now().isoformat()}] Log directory: {log_dir}")
     for ac in agents_config:
-        print(f"[{datetime.now().isoformat()}]   Agent '{ac['name']}': every {ac['frequency']} ({ac['interval_seconds']}s), query period: {ac['period_minutes']}m")
+        if ac["frequency"] == "webhook":
+            print(f"[{datetime.now().isoformat()}]   Agent '{ac['name']}': webhook-triggered, query period: {ac['period_minutes']}m")
+        else:
+            print(f"[{datetime.now().isoformat()}]   Agent '{ac['name']}': every {ac['frequency']} ({ac['interval_seconds']}s), query period: {ac['period_minutes']}m")
 
     # Create persistent agent instances (conversation history is preserved across runs)
     agents_by_name = {ac["name"]: ac for ac in agents_config}
@@ -268,36 +335,59 @@ def main():
         print("Error: No agents could be loaded.")
         return 1
 
-    # Initialize next_run timestamps — run all agents immediately
+    # Start webhook server
+    webhook_port = int(os.getenv("SNAKE_WEBHOOK_PORT", "8000"))
+    webhook_q: queue.Queue[str] = queue.Queue()
+    webhook_server = start_webhook_server(webhook_port, set(agent_instances.keys()), webhook_q)
+
+    # Initialize schedule — only for agents with interval-based frequencies
     now = time.time()
-    schedule = {name: now for name in agent_instances}
+    schedule = {
+        name: now for name in agent_instances
+        if agents_by_name[name]["interval_seconds"] is not None
+    }
 
     while not shutdown_requested:
-        # Find the agent with the soonest next_run
-        next_agent = min(schedule, key=schedule.get)
-        next_run = schedule[next_agent]
-        wait = next_run - time.time()
-
-        if wait > 0:
-            next_run_time = datetime.fromtimestamp(next_run)
-            print(f"[{datetime.now().isoformat()}] Next up: '{next_agent}' at {next_run_time.isoformat()}")
-            while not shutdown_requested and time.time() < next_run:
-                time.sleep(1)
+        # Drain webhook queue — run triggered agents immediately
+        while not webhook_q.empty() and not shutdown_requested:
+            try:
+                agent_name = webhook_q.get_nowait()
+            except queue.Empty:
+                break
+            if agent_name in agent_instances:
+                ac = agents_by_name[agent_name]
+                print(f"[{datetime.now().isoformat()}] Webhook triggered agent '{agent_name}'")
+                run_agent(agent_instances[agent_name], agent_name, agents_dir, ac["period_minutes"], log_dir)
 
         if shutdown_requested:
             break
 
-        # Run all agents that are due (may be more than one at the same time)
-        now = time.time()
-        for name, run_at in sorted(schedule.items(), key=lambda x: x[1]):
-            if shutdown_requested:
-                break
-            if run_at > now:
-                break
-            ac = agents_by_name[name]
-            run_agent(agent_instances[name], name, agents_dir, ac["period_minutes"], log_dir)
-            schedule[name] = time.time() + ac["interval_seconds"]
+        # Check scheduled agents
+        if schedule:
+            next_agent = min(schedule, key=schedule.get)
+            next_run = schedule[next_agent]
 
+            if time.time() >= next_run:
+                # Run all agents that are due
+                now = time.time()
+                for name, run_at in sorted(schedule.items(), key=lambda x: x[1]):
+                    if shutdown_requested:
+                        break
+                    if run_at > now:
+                        break
+                    ac = agents_by_name[name]
+                    run_agent(agent_instances[name], name, agents_dir, ac["period_minutes"], log_dir)
+                    schedule[name] = time.time() + ac["interval_seconds"]
+            else:
+                next_run_time = datetime.fromtimestamp(next_run)
+                print(f"[{datetime.now().isoformat()}] Next up: '{next_agent}' at {next_run_time.isoformat()}")
+                while not shutdown_requested and time.time() < next_run and webhook_q.empty():
+                    time.sleep(1)
+        else:
+            # No scheduled agents — just wait for webhooks
+            time.sleep(1)
+
+    webhook_server.shutdown()
     print(f"[{datetime.now().isoformat()}] Snake stopped.")
     return 0
 

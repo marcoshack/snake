@@ -36,6 +36,9 @@ services:
       # Path to session storage inside the container
       SNAKE_SESSIONS_DIR: /app/sessions
 
+      # Webhook server port (internal only, not exposed to host)
+      SNAKE_WEBHOOK_PORT: ${SNAKE_WEBHOOK_PORT:-8000}
+
     volumes:
       # Mount host directories (from .env) to container paths
       - ${REPORT_OUTPUT_DIR:-./reports}:/app/reports
@@ -46,3 +49,6 @@ services:
       - ${SNAKE_SESSIONS_DIR:-./sessions}:/app/sessions
 
     restart: unless-stopped
+    ports:
+      # Expose webhook server port to host
+      - "${SNAKE_WEBHOOK_PORT:-8000}:${SNAKE_WEBHOOK_PORT:-8000}"
