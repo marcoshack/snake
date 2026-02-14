@@ -1,4 +1,5 @@
 import os
+import unicodedata
 from datetime import datetime
 
 import markdown
@@ -7,7 +8,7 @@ from strands import tool
 
 
 @tool
-def get_rust_server_logs(hours: int = 24) -> str:
+def get_rust_server_logs(hours: int = 24, include: list[str] = None, exclude: list[str] = None) -> str:
     """
     Fetch logs from the Rust game server via OpenSearch.
 
@@ -18,6 +19,10 @@ def get_rust_server_logs(hours: int = 24) -> str:
 
     Args:
         hours: Number of hours to look back (default: 24)
+        include: Optional list of terms to filter by. Only logs containing at
+            least one of these terms will be returned. Example: ["[Global]", "[Better Say]"]
+        exclude: Optional list of terms to exclude. Logs containing any of
+            these terms will be filtered out. Example: ["[Team]"]
 
     Returns:
         Server logs with timestamps, useful for admin oversight
@@ -36,15 +41,32 @@ def get_rust_server_logs(hours: int = 24) -> str:
     headers = {"Content-Type": "application/json"}
     auth = (opensearch_user, opensearch_password)
 
+    # Build the bool query with time range as a must clause
+    must_clauses = [
+        {"range": {"@timestamp": {"gte": f"now-{hours}h", "lte": "now"}}}
+    ]
+
+    # Include filter: log must contain at least one of the terms
+    should_clauses = []
+    if include:
+        for term in include:
+            should_clauses.append({"match_phrase": {"log": term}})
+
+    # Exclude filter: log must not contain any of the terms
+    must_not_clauses = []
+    if exclude:
+        for term in exclude:
+            must_not_clauses.append({"match_phrase": {"log": term}})
+
+    bool_query = {"must": must_clauses}
+    if should_clauses:
+        bool_query["should"] = should_clauses
+        bool_query["minimum_should_match"] = 1
+    if must_not_clauses:
+        bool_query["must_not"] = must_not_clauses
+
     query = {
-        "query": {
-            "range": {
-                "@timestamp": {
-                    "gte": f"now-{hours}h",
-                    "lte": "now"
-                }
-            }
-        },
+        "query": {"bool": bool_query},
         "sort": [{"@timestamp": {"order": "desc"}}],
         "size": opensearch_result_size
     }
@@ -173,3 +195,74 @@ def save_report_html(report_markdown: str, filename: str = None) -> str:
         f.write(full_html)
 
     return f"Report saved to: {filepath}"
+
+
+MAX_CHAT_MESSAGE_LENGTH = 128
+
+
+def _transliterate_to_ascii(text: str) -> str:
+    """Transliterate non-ASCII characters to their closest ASCII equivalents.
+
+    The Rust RCON 'say' command does not support non-ASCII characters — they
+    render as '??' in game chat. This converts accented characters to their
+    base forms (e.g. é→e, ã→a, ç→c) and drops any remaining non-ASCII
+    characters that have no sensible ASCII mapping.
+    """
+    # Decompose unicode characters (e.g. é → e + combining accent)
+    # then drop the combining marks, keeping only the base characters
+    nfkd = unicodedata.normalize("NFKD", text)
+    return nfkd.encode("ascii", "ignore").decode("ascii")
+
+
+@tool
+def send_global_chat_message(message: str) -> str:
+    """
+    Send a message to the Rust server's Global chat channel.
+
+    The message appears in-game as a server broadcast visible to all players.
+    Uses the RCON "say" command behind the scenes.
+
+    Limitations (enforced by the Rust server):
+    - Maximum 128 characters per message
+    - Single-line only (no newlines)
+    - ASCII only (non-ASCII characters like accents are automatically
+      transliterated to their closest ASCII equivalents, e.g. é→e, ã→a)
+
+    Args:
+        message: The text to broadcast in Global chat (max 128 chars, no newlines).
+            Use only ASCII characters — accented characters will be transliterated
+            automatically but may lose meaning.
+
+    Returns:
+        Confirmation of message sent or error
+    """
+    endpoint = os.environ.get("SNAKE_CHAT_API_ENDPOINT")
+    if not endpoint:
+        return "Error: SNAKE_CHAT_API_ENDPOINT environment variable not set"
+
+    if not message or not message.strip():
+        return "Error: Message cannot be empty"
+
+    if "\n" in message or "\r" in message:
+        return "Error: Message cannot contain newlines (RCON say command is single-line only)"
+
+    # Transliterate non-ASCII characters to avoid '??' rendering in game chat
+    message = _transliterate_to_ascii(message)
+
+    if len(message) > MAX_CHAT_MESSAGE_LENGTH:
+        return f"Error: Message exceeds {MAX_CHAT_MESSAGE_LENGTH} character limit ({len(message)} chars). Shorten the message and try again."
+
+    response = requests.post(endpoint, json={"message": message})
+
+    if response.ok:
+        return "Message sent to Global chat successfully"
+    else:
+        return f"Failed to send chat message: {response.status_code} - {response.text}"
+
+
+TOOL_REGISTRY = {
+    "get_rust_server_logs": get_rust_server_logs,
+    "post_discord_admin_alert": post_discord_admin_alert,
+    "save_report_html": save_report_html,
+    "send_global_chat_message": send_global_chat_message,
+}

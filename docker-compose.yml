@@ -20,16 +20,29 @@ services:
       # Discord webhook for posting admin alerts
       DISCORD_RUST_ADMIN_WEBHOOK: ${DISCORD_RUST_ADMIN_WEBHOOK}
 
+      # Chat API endpoint for sending messages to Rust server Global chat
+      SNAKE_CHAT_API_ENDPOINT: ${SNAKE_CHAT_API_ENDPOINT}
+
       # Override paths to container paths (agent reads these inside container)
       REPORT_OUTPUT_DIR: /app/reports
       LOG_DIR: /app/logs
 
-      # How often to run the analysis
-      ANALYSIS_FREQUENCY: ${ANALYSIS_FREQUENCY:-24h}
+      # Agents to run with per-agent frequency (name:frequency pairs)
+      SNAKE_AGENTS: ${SNAKE_AGENTS:-operational-report:24h}
+
+      # Path to agent definitions inside the container
+      SNAKE_AGENTS_DIR: /app/agents
+
+      # Path to session storage inside the container
+      SNAKE_SESSIONS_DIR: /app/sessions
 
     volumes:
       # Mount host directories (from .env) to container paths
       - ${REPORT_OUTPUT_DIR:-./reports}:/app/reports
       - ${LOG_DIR:-./logs}:/app/logs
+      # Mount agents directory for hot-reload of agent definitions
+      - ${SNAKE_AGENTS_DIR:-./agents}:/app/agents
+      # Mount sessions directory for persistent conversation history
+      - ${SNAKE_SESSIONS_DIR:-./sessions}:/app/sessions
 
     restart: unless-stopped

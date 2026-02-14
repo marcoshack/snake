@@ -13,8 +13,9 @@ COPY pyproject.toml uv.lock ./
 # Install dependencies using uv (frozen to match lock file)
 RUN uv sync --frozen --no-dev --no-install-project
 
-# Copy application code
+# Copy application code and agent definitions
 COPY main.py tools.py ./
+COPY agents/ agents/
 
 # Create output directory for reports
 RUN mkdir -p /app/build/output

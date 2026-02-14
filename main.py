@@ -7,15 +7,21 @@ from contextlib import redirect_stdout, redirect_stderr
 from datetime import datetime
 from pathlib import Path
 
+import yaml
 from dotenv import load_dotenv
 from strands import Agent
+from strands.agent.conversation_manager import SummarizingConversationManager
 from strands.models.anthropic import AnthropicModel
-from tools import get_rust_server_logs, post_discord_admin_alert, save_report_html
+from strands.session import FileSessionManager
+from tools import TOOL_REGISTRY
 
 load_dotenv()
 
 # Flag for graceful shutdown
 shutdown_requested = False
+
+DEFAULT_MODEL = "claude-sonnet-4-20250514"
+DEFAULT_MAX_TOKENS = 4096
 
 
 def signal_handler(signum, frame):
@@ -59,49 +65,155 @@ def parse_duration(duration_str: str) -> int:
     return value * multipliers[unit]
 
 
-def run_analysis(agent: Agent, period_minutes: int, log_dir: Path) -> None:
-    """Run a single analysis cycle for the specified period."""
-    print(f"[{datetime.now().isoformat()}] Starting analysis for the last {period_minutes} minutes...")
+def parse_agents_config(agents_str: str) -> list[dict]:
+    """
+    Parse the SNAKE_AGENTS env var into a list of agent configs.
 
-    # Calculate hours from minutes (rounding up to ensure we get all logs)
+    Format: "name1:frequency1,name2:frequency2"
+    Example: "operational-report:1h,admin-chatbot:10m"
+
+    Returns a list of dicts with keys: name, interval_seconds, period_minutes
+    """
+    agents = []
+    for entry in agents_str.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if ":" not in entry:
+            raise ValueError(
+                f"Invalid agent entry '{entry}'. "
+                "Expected format 'name:frequency' (e.g., 'operational-report:1h')."
+            )
+        name, frequency = entry.split(":", 1)
+        name = name.strip()
+        frequency = frequency.strip()
+        interval_seconds = parse_duration(frequency)
+        period_minutes = int((interval_seconds / 60) * 1.1)
+        agents.append({
+            "name": name,
+            "frequency": frequency,
+            "interval_seconds": interval_seconds,
+            "period_minutes": period_minutes,
+        })
+    return agents
+
+
+def load_agent_definition(name: str, agents_dir: Path) -> dict:
+    """
+    Load an agent definition from a markdown file.
+
+    The file uses YAML frontmatter for configuration and the body as the
+    prompt template. Template variables {period_hours} and {period_minutes}
+    are substituted at runtime.
+
+    Returns a dict with keys: tools, model, max_tokens, prompt_template
+    """
+    filepath = agents_dir / f"{name}.md"
+    if not filepath.exists():
+        raise FileNotFoundError(f"Agent definition not found: {filepath}")
+
+    content = filepath.read_text()
+
+    # Parse YAML frontmatter (between --- delimiters)
+    if not content.startswith("---"):
+        raise ValueError(f"Agent definition {filepath} must start with YAML frontmatter (---)")
+
+    parts = content.split("---", 2)
+    if len(parts) < 3:
+        raise ValueError(f"Agent definition {filepath} has invalid frontmatter format")
+
+    frontmatter = yaml.safe_load(parts[1])
+    prompt_template = parts[2].strip()
+
+    tool_names = frontmatter.get("tools", [])
+    tools = []
+    for tool_name in tool_names:
+        if tool_name not in TOOL_REGISTRY:
+            raise ValueError(f"Unknown tool '{tool_name}' in agent '{name}'. Available: {list(TOOL_REGISTRY.keys())}")
+        tools.append(TOOL_REGISTRY[tool_name])
+
+    return {
+        "tools": tools,
+        "model": frontmatter.get("model", DEFAULT_MODEL),
+        "max_tokens": frontmatter.get("max_tokens", DEFAULT_MAX_TOKENS),
+        "prompt_template": prompt_template,
+    }
+
+
+def create_agent(name: str, agents_dir: Path, period_minutes: int, sessions_dir: Path) -> tuple[Agent, dict] | None:
+    """Create a persistent agent instance from its definition file.
+
+    Uses FileSessionManager to persist conversation history to disk so it
+    survives process/container restarts.
+
+    Returns a tuple of (Agent, definition_dict) or None if loading fails.
+    """
+    try:
+        definition = load_agent_definition(name, agents_dir)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"[{datetime.now().isoformat()}] Failed to load agent '{name}': {e}")
+        return None
+
     period_hours = max(1, int((period_minutes + 59) / 60))
+    system_prompt = definition["prompt_template"].format(
+        period_hours=period_hours,
+        period_minutes=period_minutes,
+    )
 
-    # Create a log file for this analysis run
+    model = AnthropicModel(model_id=definition["model"], max_tokens=definition["max_tokens"])
+    session_manager = FileSessionManager(
+        session_id=f"snake-{name}",
+        storage_dir=str(sessions_dir),
+    )
+    conversation_manager = SummarizingConversationManager()
+    agent = Agent(
+        model=model,
+        tools=definition["tools"],
+        system_prompt=system_prompt,
+        session_manager=session_manager,
+        conversation_manager=conversation_manager,
+        agent_id=name,
+    )
+
+    print(f"[{datetime.now().isoformat()}] Created persistent agent '{name}' (session: {sessions_dir})")
+    return agent, definition
+
+
+def refresh_agent_system_prompt(agent: Agent, name: str, agents_dir: Path, period_minutes: int) -> None:
+    """Reload the agent definition from disk and update the system prompt.
+
+    This allows hot-reloading prompt changes without losing conversation history.
+    """
+    try:
+        definition = load_agent_definition(name, agents_dir)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"[{datetime.now().isoformat()}] Failed to reload agent '{name}': {e}")
+        return
+
+    period_hours = max(1, int((period_minutes + 59) / 60))
+    agent.system_prompt = definition["prompt_template"].format(
+        period_hours=period_hours,
+        period_minutes=period_minutes,
+    )
+
+
+def run_agent(agent: Agent, name: str, agents_dir: Path, period_minutes: int, log_dir: Path) -> None:
+    """Run a single analysis cycle on a persistent agent instance."""
+    print(f"[{datetime.now().isoformat()}] Running agent '{name}'...")
+
+    # Reload system prompt from disk to pick up any changes
+    refresh_agent_system_prompt(agent, name, agents_dir, period_minutes)
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    agent_log_file = log_dir / f"agent_log_{timestamp}.txt"
+    agent_log_file = log_dir / f"agent_log_{name}_{timestamp}.txt"
 
     try:
-        # Redirect agent output (both stdout and stderr) to log file
         with open(agent_log_file, 'w') as f:
             with redirect_stdout(f), redirect_stderr(f):
-                agent(f"""
-Fetch the server logs from the Rust game server by calling get_rust_server_logs(hours={period_hours}).
-This will fetch logs for approximately the last {period_minutes} minutes.
-
-Analyze the logs focusing on:
-1. **Period & Activity Level**: Time range and overall activity
-2. **Cheating Detection**: Look carefully for:
-   - Anti-cheat violations or suspicious behavior in server logs
-   - Players discussing cheating (hacks, aimbots, exploits) in chat
-   - Unusual kill patterns or impossible actions
-3. **Technical Issues**: Server errors, crashes, performance problems
-4. **Notable Incidents**: Admin actions, rule violations
-
-After analysis, ALWAYS post to Discord:
-- If everything is normal: Post a brief status update (1-2 sentences)
-- If there are security concerns or urgent issues: Post the FULL detailed analysis including player names, timestamps, and specific evidence
-
-Security concerns that require full analysis:
-- Cheating attempts (confirmed or suspected)
-- Technical problems affecting gameplay
-- Serious rule violations
-
-Finally, save the full report as an HTML file for archival.
-""")
-        print(f"[{datetime.now().isoformat()}] Analysis completed successfully.")
-        print(f"[{datetime.now().isoformat()}] Agent output saved to: {agent_log_file.name}")
+                agent("Run your analysis cycle now.")
+        print(f"[{datetime.now().isoformat()}] Agent '{name}' completed. Log: {agent_log_file.name}")
     except Exception as e:
-        print(f"[{datetime.now().isoformat()}] Analysis failed with error: {e}")
+        print(f"[{datetime.now().isoformat()}] Agent '{name}' failed: {e}")
 
 
 def main():
@@ -109,47 +221,84 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
 
-    # Parse the analysis frequency
-    frequency_str = os.getenv("ANALYSIS_FREQUENCY", "24h")
+    # Parse agent list with per-agent frequencies
+    agents_str = os.getenv("SNAKE_AGENTS", "operational-report:24h")
     try:
-        interval_seconds = parse_duration(frequency_str)
+        agents_config = parse_agents_config(agents_str)
     except ValueError as e:
         print(f"Error: {e}")
         return 1
 
-    # Calculate analysis period with 10% buffer
-    period_minutes = int((interval_seconds / 60) * 1.1)
+    if not agents_config:
+        print("Error: SNAKE_AGENTS is empty. Set it to 'name:frequency' pairs (e.g., 'operational-report:1h,admin-chatbot:10m').")
+        return 1
+
+    agents_dir = Path(os.getenv("SNAKE_AGENTS_DIR", "./agents"))
+    if not agents_dir.is_dir():
+        print(f"Error: Agents directory not found: {agents_dir}")
+        return 1
 
     # Set up log directory for agent output
     log_dir = Path(os.getenv("LOG_DIR", "./logs"))
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[{datetime.now().isoformat()}] Snake agent starting...")
-    print(f"[{datetime.now().isoformat()}] Analysis frequency: {frequency_str} ({interval_seconds} seconds)")
-    print(f"[{datetime.now().isoformat()}] Analysis period: {period_minutes} minutes (includes 10% buffer)")
-    print(f"[{datetime.now().isoformat()}] Agent output will be logged to: {log_dir}")
+    # Set up sessions directory for persistent conversation history
+    sessions_dir = Path(os.getenv("SNAKE_SESSIONS_DIR", "./sessions"))
+    sessions_dir.mkdir(parents=True, exist_ok=True)
 
-    # Create the agent
-    model = AnthropicModel(model_id="claude-sonnet-4-20250514", max_tokens=4096)
-    agent = Agent(model=model, tools=[get_rust_server_logs, post_discord_admin_alert, save_report_html])
+    print(f"[{datetime.now().isoformat()}] Snake starting...")
+    print(f"[{datetime.now().isoformat()}] Agents directory: {agents_dir}")
+    print(f"[{datetime.now().isoformat()}] Sessions directory: {sessions_dir}")
+    print(f"[{datetime.now().isoformat()}] Log directory: {log_dir}")
+    for ac in agents_config:
+        print(f"[{datetime.now().isoformat()}]   Agent '{ac['name']}': every {ac['frequency']} ({ac['interval_seconds']}s), query period: {ac['period_minutes']}m")
 
-    # Run the first analysis immediately
-    run_analysis(agent, period_minutes, log_dir)
+    # Create persistent agent instances (conversation history is preserved across runs)
+    agents_by_name = {ac["name"]: ac for ac in agents_config}
+    agent_instances: dict[str, Agent] = {}
 
-    # Continue running periodically until shutdown is requested
+    for ac in agents_config:
+        result = create_agent(ac["name"], agents_dir, ac["period_minutes"], sessions_dir)
+        if result is None:
+            print(f"[{datetime.now().isoformat()}] Skipping agent '{ac['name']}' due to load failure.")
+            continue
+        agent_instances[ac["name"]] = result[0]
+
+    if not agent_instances:
+        print("Error: No agents could be loaded.")
+        return 1
+
+    # Initialize next_run timestamps — run all agents immediately
+    now = time.time()
+    schedule = {name: now for name in agent_instances}
+
     while not shutdown_requested:
-        next_run = datetime.now().timestamp() + interval_seconds
-        next_run_time = datetime.fromtimestamp(next_run)
-        print(f"[{datetime.now().isoformat()}] Next analysis scheduled for: {next_run_time.isoformat()}")
+        # Find the agent with the soonest next_run
+        next_agent = min(schedule, key=schedule.get)
+        next_run = schedule[next_agent]
+        wait = next_run - time.time()
 
-        # Sleep in small increments to allow for graceful shutdown
-        while not shutdown_requested and time.time() < next_run:
-            time.sleep(1)
+        if wait > 0:
+            next_run_time = datetime.fromtimestamp(next_run)
+            print(f"[{datetime.now().isoformat()}] Next up: '{next_agent}' at {next_run_time.isoformat()}")
+            while not shutdown_requested and time.time() < next_run:
+                time.sleep(1)
 
-        if not shutdown_requested:
-            run_analysis(agent, period_minutes, log_dir)
+        if shutdown_requested:
+            break
 
-    print(f"[{datetime.now().isoformat()}] Snake agent stopped.")
+        # Run all agents that are due (may be more than one at the same time)
+        now = time.time()
+        for name, run_at in sorted(schedule.items(), key=lambda x: x[1]):
+            if shutdown_requested:
+                break
+            if run_at > now:
+                break
+            ac = agents_by_name[name]
+            run_agent(agent_instances[name], name, agents_dir, ac["period_minutes"], log_dir)
+            schedule[name] = time.time() + ac["interval_seconds"]
+
+    print(f"[{datetime.now().isoformat()}] Snake stopped.")
     return 0
 
 
