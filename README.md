@@ -47,6 +47,7 @@ cp .env.example .env
 | `LOG_DIR` | Directory for agent execution logs | `./logs` |
 | `SNAKE_AGENTS` | Agents and their frequencies | `operational-report:24h` |
 | `SNAKE_AGENTS_DIR` | Path to agent definitions | `./agents` |
+| `SNAKE_WEBHOOK_PORT` | Port for the webhook HTTP server | `8000` |
 
 ### SNAKE_AGENTS format
 
@@ -58,6 +59,28 @@ SNAKE_AGENTS=operational-report:1h,admin-chatbot:10m
 ```
 
 Supported frequency units: `m` (minutes), `h` (hours), `d` (days), `w` (weeks).
+
+Agents can also use `webhook` as their frequency to be triggered on-demand via HTTP instead of running on a schedule:
+
+```bash
+# operational-report runs every hour, admin-chatbot is triggered via webhook
+SNAKE_AGENTS=operational-report:1h,admin-chatbot:webhook
+```
+
+Webhook-triggered agents use a default query period of 5 minutes.
+
+### Webhooks
+
+Snake starts an HTTP server (default port `8000`, configurable via `SNAKE_WEBHOOK_PORT`) that accepts POST requests to trigger agents on demand. Any agent listed in `SNAKE_AGENTS` can be triggered via webhook, regardless of whether it also runs on a schedule.
+
+```bash
+# Trigger the admin-chatbot agent
+curl -X POST http://localhost:8000/agents/admin-chatbot
+```
+
+The server responds with `202 Accepted` and queues the agent for immediate execution. If the agent name is not found, it returns `404`.
+
+When running with Docker Compose, the webhook port is exposed to the host automatically.
 
 ## Running locally
 
